@@ -8,24 +8,24 @@ Supports:
 - Variable board sizes
 - Choosing Human or Computer for Blue and Red players
 - Per-player letter choices (S or O) for humans
-- New Game button
-- Turn tracking, score display, and winner/draw alerts
-- Automatic computer moves (including extra turns in General mode)
+- Recording games to a text file
+- Replaying recorded games from a text file (animated)
 """
 
 import tkinter as tk
-from tkinter import ttk, messagebox
+from tkinter import ttk, messagebox, filedialog
 
 from .models import GameMode, Player, Letter
 from .modes import make_game
 from .players import HumanPlayer, ComputerPlayer
+from .recorder import GameRecorder, load_recording, RecordedMove
 
 
 class SOSApp(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("SOS - Sprint 4")
-        self.geometry("750x650")
+        self.title("SOS - Final Sprint")
+        self.geometry("780x680")
 
         # --- Game state ---
         self.mode_var = tk.StringVar(value="SIMPLE")
@@ -37,6 +37,15 @@ class SOSApp(tk.Tk):
             Player.BLUE: HumanPlayer(Player.BLUE),
             Player.RED: HumanPlayer(Player.RED),
         }
+
+        # Recording
+        self.record_var = tk.BooleanVar(value=False)
+        self.recorder = GameRecorder()
+
+        # Replay state
+        self.replay_active: bool = False
+        self._replay_moves: list[RecordedMove] = []
+        self._replay_index: int = 0
 
         # --- Build GUI ---
         self._build_controls()
@@ -51,9 +60,8 @@ class SOSApp(tk.Tk):
         self.status_var = tk.StringVar(value=self._status_text())
         ttk.Label(self, textvariable=self.status_var, font=("Arial", 12)).pack(pady=8)
 
-        # Ensure players dict matches initial radio button selections
+        # Set initial players and maybe let a computer start (if configured)
         self._update_player_types()
-        # If the first player is a computer, let it start
         self._maybe_let_computer_play()
 
     # ------------------------------------------------------------------
@@ -81,6 +89,16 @@ class SOSApp(tk.Tk):
 
         ttk.Button(frame, text="New Game", command=self.on_new_game).grid(
             row=0, column=5, padx=12
+        )
+
+        # Record game checkbox
+        ttk.Checkbutton(
+            frame, text="Record game", variable=self.record_var
+        ).grid(row=0, column=6, padx=12, sticky="w")
+
+        # Replay button
+        ttk.Button(frame, text="Replay", command=self.on_replay).grid(
+            row=0, column=7, padx=12
         )
 
     def _build_player_panels(self):
@@ -152,8 +170,9 @@ class SOSApp(tk.Tk):
             legend,
             text=(
                 "Click a cell to place a letter for a human.\n"
-                "Computer moves are made automatically\n"
-                "when it is the computer's turn."
+                "Computer moves are automatic.\n"
+                "Recording saves the game to a file.\n"
+                "Replay loads and replays a saved game."
             ),
         ).pack(anchor="w", padx=8, pady=4)
 
@@ -200,6 +219,10 @@ class SOSApp(tk.Tk):
     # ------------------------------------------------------------------
     def on_new_game(self):
         """Start a new game with selected mode and size."""
+        if self.replay_active:
+            # Stop any ongoing replay
+            self.replay_active = False
+
         size = max(3, int(self.size_var.get()))
         mode = GameMode.SIMPLE if self.mode_var.get() == "SIMPLE" else GameMode.GENERAL
         self.game = make_game(size, mode)
@@ -207,11 +230,34 @@ class SOSApp(tk.Tk):
         self._build_board()
         self._update_status()
 
-        # After resetting, if first player is computer, let it move.
+        # Stop any existing recording and start new if requested
+        self.recorder.deactivate()
+        if self.record_var.get():
+            path = filedialog.asksaveasfilename(
+                title="Save recording as",
+                defaultextension=".txt",
+                filetypes=[("Text files", "*.txt"), ("All files", "*.*")],
+            )
+            if path:
+                self.recorder.start(
+                    path,
+                    size=size,
+                    mode=mode,
+                    blue_type=self.blue_type.get(),
+                    red_type=self.red_type.get(),
+                )
+            else:
+                # User canceled; turn off recording
+                self.record_var.set(False)
+
+        # If first player is a computer, let it move
         self._maybe_let_computer_play()
 
     def on_cell_click(self, r: int, c: int):
         """Handle cell clicks from players (humans only)."""
+        if self.replay_active:
+            return  # ignore clicks during replay
+
         if self.game.is_over:
             messagebox.showinfo("Game Over", "Start a new game to play again.")
             return
@@ -235,11 +281,98 @@ class SOSApp(tk.Tk):
             messagebox.showwarning("Invalid Move", "That cell is already occupied.")
             return
 
+        self._record_move(current_player, r, c, letter)
         self._refresh_board_text()
         self._update_status()
 
         # After a human move, let the computer(s) play if it's their turn.
         self._maybe_let_computer_play()
+
+        # If the game ended on a human move (no computer turn), handle end.
+        if self.game.is_over and not self.replay_active:
+            self._handle_game_end()
+
+    def on_replay(self):
+        """Start replaying a recorded game from file."""
+        if self.recorder.active:
+            # Stop current recording session
+            self.recorder.deactivate()
+            self.record_var.set(False)
+
+        path = filedialog.askopenfilename(
+            title="Open recording",
+            filetypes=[("Text files", "*.txt"), ("All files", "*.*")],
+        )
+        if not path:
+            return
+
+        try:
+            data = load_recording(path)
+        except Exception as e:
+            messagebox.showerror("Replay error", f"Failed to load recording:\n{e}")
+            return
+
+        # Configure GUI to match the recording header (mode, size, player types)
+        self.replay_active = True
+        self.mode_var.set("SIMPLE" if data.mode == GameMode.SIMPLE else "GENERAL")
+        self.size_var.set(data.size)
+        self.blue_type.set(data.blue_type)
+        self.red_type.set(data.red_type)
+        self._update_player_types()
+
+        # Initialize a fresh game for replay
+        self.game = make_game(data.size, data.mode)
+        self.game.start_new_game(size=data.size, mode=data.mode)
+        self._build_board()
+        self._update_status()
+
+        # Load moves and start stepwise replay
+        self._replay_moves = data.moves
+        self._replay_index = 0
+
+        if not self._replay_moves:
+            messagebox.showinfo("Replay", "Recording has no moves.")
+            self.replay_active = False
+            return
+
+        # Disable recording during replay
+        self.recorder.deactivate()
+        self.record_var.set(False)
+
+        # Start animated replay
+        self.after(500, self._replay_next_move)
+
+    # ------------------------------------------------------------------
+    # Replay helpers
+    # ------------------------------------------------------------------
+    def _replay_next_move(self):
+        """Apply the next recorded move and schedule the following one."""
+        if not self.replay_active:
+            return
+
+        if self._replay_index >= len(self._replay_moves):
+            # Replay finished
+            self.replay_active = False
+            # Game state (winner/draw) should reflect original after final move
+            self._update_status()
+            return
+
+        move = self._replay_moves[self._replay_index]
+        self._replay_index += 1
+
+        # Force current turn to recorded player to keep scoring consistent
+        self.game.current_turn = move.player
+        self.game.make_move(move.row, move.col, move.letter)
+
+        self._refresh_board_text()
+        self._update_status()
+
+        if self._replay_index < len(self._replay_moves):
+            self.after(500, self._replay_next_move)
+        else:
+            # End of replay
+            self.replay_active = False
+            self._update_status()
 
     # ------------------------------------------------------------------
     # Computer turn driver
@@ -250,6 +383,9 @@ class SOSApp(tk.Tk):
         In General mode, this may allow multiple consecutive moves if the
         computer keeps forming SOS sequences.
         """
+        if self.replay_active:
+            return  # no AI during replay
+
         while not self.game.is_over:
             current_player = self.game.current_turn
             player_obj = self.players[current_player]
@@ -267,16 +403,38 @@ class SOSApp(tk.Tk):
                 # Safety: if for any reason the move is invalid, stop to avoid a loop
                 break
 
+            self._record_move(current_player, r, c, letter)
             self._refresh_board_text()
             self._update_status()
 
-        # If game ended during computer moves, show result.
-        if self.game.is_over:
-            if self.game.is_draw:
-                messagebox.showinfo("Result", "Game ended in a draw.")
+        # If game ended during computer moves, handle end.
+        if self.game.is_over and not self.replay_active:
+            self._handle_game_end()
+
+    # ------------------------------------------------------------------
+    # Recording helpers
+    # ------------------------------------------------------------------
+    def _record_move(self, player: Player, r: int, c: int, letter: Letter):
+        """Forward a move to the recorder if recording is active."""
+        if self.recorder.active and not self.replay_active:
+            self.recorder.record_move(player, r, c, letter)
+
+    def _handle_game_end(self):
+        """Common logic when a game ends: finish recording and show result."""
+        # Finish recording if active
+        self.recorder.finish(self.game.winner, self.game.is_draw)
+
+        # Show result dialog
+        if self.game.is_draw:
+            messagebox.showinfo("Result", "Game ended in a draw.")
+        else:
+            if self.game.winner is None:
+                messagebox.showinfo("Result", "Game over.")
             else:
                 winner = "Blue" if self.game.winner == Player.BLUE else "Red"
                 messagebox.showinfo("Result", f"{winner} wins!")
+
+        self._update_status()
 
     # ------------------------------------------------------------------
     # Utility / Display Methods
